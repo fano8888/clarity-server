@@ -8,22 +8,33 @@ const ffprobePath = require('ffprobe-static').path;
 const path        = require('path');
 const fs          = require('fs');
 const os          = require('os');
-const { spawn }   = require('child_process');
+const { execSync, spawn } = require('child_process');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
-console.log('ffmpeg:', ffmpegPath);
-console.log('ffprobe:', ffprobePath);
 
 const app  = express();
 const PORT = process.env.PORT || 3333;
 const UPLOAD_DIR = path.join(os.tmpdir(), 'clarity-uploads');
 const OUTPUT_DIR = path.join(os.tmpdir(), 'clarity-outputs');
-const STAB_DIR   = path.join(os.tmpdir(), 'clarity-stab');
-[UPLOAD_DIR, OUTPUT_DIR, STAB_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
+[UPLOAD_DIR, OUTPUT_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 app.use(express.json());
+
+// ── Check which FFmpeg filters are available ──────
+let AVAIL = { vidstab: false, arnndn: false, hqdn3d: false, minterpolate: false };
+try {
+  const out = execSync(`"${ffmpegPath}" -filters 2>&1`, { encoding: 'utf8', timeout: 10000 });
+  AVAIL.vidstab      = out.includes('vidstab');
+  AVAIL.arnndn       = out.includes('arnndn');
+  AVAIL.hqdn3d       = out.includes('hqdn3d');
+  AVAIL.minterpolate = out.includes('minterpolate');
+  console.log('Available filters:', AVAIL);
+} catch(e) {
+  console.warn('Could not check filters:', e.message);
+  AVAIL.hqdn3d = AVAIL.minterpolate = true; // assume available
+}
 
 const storage = multer.diskStorage({
   destination: UPLOAD_DIR,
@@ -57,7 +68,6 @@ app.post('/fix', upload.single('video'), (req, res) => {
   processVideo(job, { upscale, fps, mode });
 });
 
-// ── Helpers ───────────────────────────────────────
 function runCmd(bin, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(bin, args);
@@ -66,7 +76,7 @@ function runCmd(bin, args) {
     proc.stderr.on('data', d => err += d.toString());
     proc.on('close', code => code === 0
       ? resolve({ out, err })
-      : reject(new Error(`Exit ${code}: ${err.slice(-600)}`))
+      : reject(new Error(err.slice(-800)))
     );
   });
 }
@@ -86,11 +96,10 @@ function parseFreezeZones(stderr) {
   return zones;
 }
 
-// ── Main processing pipeline ──────────────────────
 async function processVideo(job, opts) {
-  job.status = 'processing'; job.progress = 2; job.message = 'Probing video…';
+  job.status = 'processing'; job.progress = 2; job.message = 'Probing…';
   try {
-    // ── 1. Probe ──────────────────────────────────
+    // ── Probe ─────────────────────────────────────
     const probe = await new Promise((resolve, reject) =>
       ffmpeg.ffprobe(job.inputFile, (err, d) => err ? reject(err) : resolve(d))
     );
@@ -104,166 +113,147 @@ async function processVideo(job, opts) {
     const hasAudio = !!as;
     const isPodcast = opts.mode === 'podcast';
 
-    job.message  = `${srcW}×${srcH} · ${Math.round(srcFps)}fps · ${dur.toFixed(1)}s`;
+    job.message  = `${srcW}×${srcH} · ${Math.round(srcFps)}fps · ${dur.toFixed(1)}s · audio:${hasAudio}`;
     job.progress = 5;
 
-    // ── 2. Target resolution ──────────────────────
+    // ── Resolution ────────────────────────────────
     let scaleW = srcW, scaleH = srcH;
     if (opts.upscale === '4k')   { scaleW = 3840; scaleH = 2160; }
     if (opts.upscale === '2k')   { scaleW = 2560; scaleH = 1440; }
     if (opts.upscale === '1080') { scaleW = 1920; scaleH = 1080; }
     if (scaleW < srcW)           { scaleW = srcW;  scaleH = srcH; }
 
-    // ── 3. Detect freeze/black zones ─────────────
-    job.message  = 'Detecting lag & black zones…';
-    job.progress = 7;
-
-    const freezeNoise = isPodcast ? '-50' : '-60';
-    const freezeDur   = isPodcast ? '0.04' : '0.08';
-    let freezeZones   = [];
+    // ── Detect freeze zones ───────────────────────
+    job.message = 'Detecting lag zones…'; job.progress = 7;
+    let freezeZones = [];
     try {
-      const { err: fderr } = await runCmd(ffmpegPath, [
+      const freezeNoise = isPodcast ? '-50' : '-60';
+      const freezeDur   = isPodcast ? '0.04' : '0.08';
+      const { err: fd } = await runCmd(ffmpegPath, [
         '-i', job.inputFile,
         '-vf', `freezedetect=noise=${freezeNoise}dB:duration=${freezeDur}`,
         '-f', 'null', '-',
       ]);
-      freezeZones = parseFreezeZones(fderr);
-      console.log(`[${job.id}] ${freezeZones.length} freeze zones, total ${freezeZones.reduce((a,z)=>a+z.duration,0).toFixed(1)}s`);
-    } catch(e) {
-      console.warn(`[${job.id}] freezedetect warn:`, e.message);
-    }
+      freezeZones = parseFreezeZones(fd);
+      console.log(`[${job.id}] ${freezeZones.length} freeze zones`);
+    } catch(e) { console.warn('freezedetect:', e.message.slice(0,100)); }
 
-    job.message  = `${freezeZones.length} lag zone${freezeZones.length===1?'':'s'} found — fixing…`;
+    job.message  = `${freezeZones.length} lag zone${freezeZones.length===1?'':'s'} — fixing all…`;
     job.progress = 10;
 
-    // ── 4. Stabilisation pass (2-pass vidstab) ────
-    //
-    // vidstabdetect: analyses motion in each frame, writes to .trf file
-    // vidstabtransform: applies smooth compensation based on .trf data
-    //
-    // shakiness=8: aggressive motion detection (1=low, 10=max)
-    // accuracy=15: highest accuracy motion analysis
-    // smoothing=10: how many frames to average for smoothing
-    // optzoom=1: auto-zoom to remove black borders from stabilisation
-    // interpol=bicubic: bicubic interpolation (sharpest)
-    //
-    const stabTrf  = path.join(STAB_DIR, `${job.id}.trf`);
-    let   stabDone = false;
-    try {
-      job.message  = 'Stabilising video (pass 1)…';
-      job.progress = 12;
-      await new Promise((resolve, reject) => {
-        ffmpeg(job.inputFile)
-          .outputOptions([
-            '-vf', `vidstabdetect=shakiness=8:accuracy=15:result=${stabTrf}`,
-            '-f', 'null',
-          ])
-          .output('-')
-          .on('end', resolve)
-          .on('error', reject)
-          .run();
-      });
-      stabDone = true;
-      job.message  = 'Stabilisation pass 1 complete';
-      job.progress = 18;
-    } catch(e) {
-      console.warn(`[${job.id}] vidstab pass 1 warn:`, e.message);
-    }
+    // ── Build video filter ────────────────────────
+    // Strategy: remove duplicate frames → re-time → interpolate smooth
+    // replacements → denoise → sharpen → scale
+    const vf = [];
 
-    // ── 5. Build video filter chain ───────────────
-    //
-    // Order matters:
-    // a) mpdecimate    — remove duplicate/frozen frames first
-    // b) setpts        — re-time after removal (critical for sync)
-    // c) vidstabtransform — stabilise (after timing is fixed)
-    // d) minterpolate  — synthesise smooth frames to fill gaps
-    // e) hqdn3d        — denoise compressed webcam artifacts
-    // f) unsharp       — restore crispness after denoising
-    // g) scale         — upscale if requested
-    //
-    const vFilters = [];
-
-    // Lag removal
-    if (isPodcast) {
-      vFilters.push(`mpdecimate=max=0:hi=512:lo=256:frac=0.1`);
-    } else {
-      vFilters.push(`mpdecimate=max=0:hi=1536:lo=768:frac=0.25`);
-    }
-    vFilters.push(`setpts=N/FRAME_RATE/TB`);
-
-    // Stabilisation (only if pass 1 succeeded)
-    if (stabDone && fs.existsSync(stabTrf)) {
-      vFilters.push(`vidstabtransform=input=${stabTrf}:smoothing=10:optzoom=1:interpol=bicubic`);
-      vFilters.push(`unsharp=5:5:0.8:3:3:0.4`); // mild sharpen after stab warp
-    }
-
-    // Motion-compensated interpolation — fills all lag/freeze gaps
-    vFilters.push(
-      `minterpolate=fps=${outFps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff`
+    // Remove frozen/duplicate frames — aggressive for podcast, moderate otherwise
+    vf.push(isPodcast
+      ? `mpdecimate=max=0:hi=512:lo=256:frac=0.1`
+      : `mpdecimate=max=0:hi=1536:lo=768:frac=0.25`
     );
 
-    // Denoise — removes webcam/network compression artifacts
-    if (isPodcast) {
-      // hqdn3d: 3D adaptive denoiser
-      // luma_spatial=4: moderate spatial denoise (removes blockiness)
-      // chroma_spatial=3: slight chroma denoise (removes color noise)
-      // luma_tmp=6: temporal denoise (removes frame-to-frame flicker)
-      // chroma_tmp=4: temporal chroma denoise
-      vFilters.push(`hqdn3d=luma_spatial=4:chroma_spatial=3:luma_tmp=6:chroma_tmp=4`);
-      vFilters.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=2.0:chroma_msize_x=3:chroma_msize_y=3:chroma_amount=0.8`);
+    // Re-time after removal — this is what fixes the video timeline
+    vf.push(`setpts=N/FRAME_RATE/TB`);
+
+    // Synthesise smooth replacement frames via motion-compensated interpolation
+    // This is the core fix — fills every gap with a proper generated frame
+    if (AVAIL.minterpolate) {
+      vf.push(`minterpolate=fps=${outFps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff`);
     } else {
-      vFilters.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=1.5:chroma_msize_x=3:chroma_msize_y=3:chroma_amount=0.5`);
+      // Fallback: fps filter just ensures constant frame rate
+      vf.push(`fps=${outFps}`);
     }
+
+    // Denoise: removes webcam compression artifacts from bad connection
+    if (AVAIL.hqdn3d && isPodcast) {
+      vf.push(`hqdn3d=luma_spatial=4:chroma_spatial=3:luma_tmp=6:chroma_tmp=4`);
+    }
+
+    // Sharpen: restores crispness
+    vf.push(`unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=${isPodcast?2.0:1.5}:chroma_msize_x=3:chroma_msize_y=3:chroma_amount=${isPodcast?0.8:0.5}`);
 
     // Scale
     if (scaleW !== srcW) {
-      vFilters.push(`scale=${scaleW}:${scaleH}:flags=lanczos:force_original_aspect_ratio=decrease`);
-      vFilters.push(`pad=${scaleW}:${scaleH}:(ow-iw)/2:(oh-ih)/2:color=black`);
+      vf.push(`scale=${scaleW}:${scaleH}:flags=lanczos:force_original_aspect_ratio=decrease`);
+      vf.push(`pad=${scaleW}:${scaleH}:(ow-iw)/2:(oh-ih)/2:color=black`);
     }
-    vFilters.push(`format=yuv420p`);
+    vf.push(`format=yuv420p`);
 
-    // ── 6. Build audio filter chain ───────────────
+    // ── Build audio filter chain ─────────────────
     //
-    // arnndn: AI neural network speech denoiser
-    //   Trained specifically on voice/speech audio.
-    //   Removes: background hum, room echo, fan noise,
-    //   compression artifacts, network noise.
-    //   model=cb: the "convolutional blind" model — best for varied noise
+    // Stage 1 — highpass=f=80
+    //   Cuts everything below 80Hz — removes low-frequency rumble,
+    //   desk vibration, HVAC hum, mic handling noise.
+    //   Human voice starts at ~85Hz so nothing useful is lost.
     //
-    // aresample async=1: continuously adjusts audio to match video clock
-    //   This is what prevents audio drift after frame removal.
-    //   min_hard_comp=0.1: max 0.1 sample adjustment per step (no glitches)
-    //   first_pts=0: anchor audio start to 0
+    // Stage 2 — lowpass=f=12000
+    //   Cuts harsh high-frequency noise above 12kHz — internet
+    //   compression artifacts, hiss, digital noise.
+    //   Voice clarity lives in 80Hz–8kHz range.
     //
-    // asetpts N/SR/TB: hard-reset audio timestamps from sample index
-    //   Eliminates any residual drift from the original file.
+    // Stage 3 — arnndn (if available)
+    //   AI neural network trained on speech. Removes background
+    //   noise, room echo, fan noise, network compression.
     //
-    // loudnorm I=-14: EBU R128 broadcast loudness normalisation
-    //   -14 LUFS = YouTube/Spotify/broadcast standard
-    //   TP=-1: true peak limit (headroom before clipping)
-    //   LRA=11: loudness range (natural dynamic feel)
+    // Stage 4 — agate=threshold=0.02:ratio=10:attack=2:release=200
+    //   Noise gate: silences audio below 2% amplitude threshold.
+    //   attack=2ms: opens instantly when speech starts (no clipping)
+    //   release=200ms: stays open 200ms after speech ends (natural)
+    //   Removes mouth clicks, keyboard noise, room tone between words.
     //
-    // aformat 48000 stereo: force universal audio format
+    // Stage 5 — equalizer chain (podcast voice EQ)
+    //   f=200:t=o:w=100:g=-3   — cut muddy low-mids (boxiness)
+    //   f=3000:t=o:w=500:g=2   — boost presence (voice intelligibility)
+    //   f=8000:t=o:w=2000:g=1  — air boost (crispness, not harshness)
     //
-    const aFilters = hasAudio ? [
-      `arnndn=model=cb`,                                          // AI speech denoiser
-      `aresample=async=1:min_hard_comp=0.1:first_pts=0`,         // sync to video clock
-      `asetpts=N/SR/TB`,                                          // hard timestamp reset
-      `loudnorm=I=-14:TP=-1:LRA=11`,                             // broadcast loudness
-      `aformat=sample_rates=48000:channel_layouts=stereo`,        // universal format
-    ] : null;
+    // Stage 6 — acompressor
+    //   Dynamic range compression for consistent loudness:
+    //   threshold=-18dB: compress above this level
+    //   ratio=4: 4:1 compression ratio (natural, not squashed)
+    //   attack=5ms: fast enough to catch transients
+    //   release=100ms: natural release
+    //   makeup=3dB: gain back what compression took
+    //
+    // Stage 7 — aresample async=1
+    //   Locks audio to video clock after frame removal. Critical for sync.
+    //
+    // Stage 8 — loudnorm I=-14
+    //   EBU R128 broadcast loudness normalisation.
+    //   -14 LUFS = YouTube/Spotify/broadcast standard.
+    //
+    const af = [];
+    // Cut sub-bass rumble and high-frequency hiss
+    af.push(`highpass=f=80`);
+    af.push(`lowpass=f=12000`);
+    // AI speech denoiser if available
+    if (AVAIL.arnndn) af.push(`arnndn=model=cb`);
+    // Noise gate — silences background between words
+    af.push(`agate=threshold=0.02:ratio=10:attack=2:release=200`);
+    // Voice EQ — cut mud, boost presence and air
+    af.push(`equalizer=f=200:t=o:w=100:g=-3`);
+    af.push(`equalizer=f=3000:t=o:w=500:g=2`);
+    af.push(`equalizer=f=8000:t=o:w=2000:g=1`);
+    // Compression — consistent loudness
+    af.push(`acompressor=threshold=-18dB:ratio=4:attack=5:release=100:makeup=3dB`);
+    // Sync audio to video clock — prevents drift
+    af.push(`aresample=async=1:min_hard_comp=0.1:first_pts=0`);
+    af.push(`asetpts=N/SR/TB`);
+    // Broadcast loudness normalisation
+    af.push(`loudnorm=I=-14:TP=-1:LRA=11`);
+    af.push(`aformat=sample_rates=48000:channel_layouts=stereo`);
 
-    job.progress = 22;
-    job.message  = `Processing ${isPodcast?'podcast':'standard'} · stab:${stabDone} · ${scaleW}×${scaleH}…`;
+    job.progress = 14;
+    job.message  = `Running FFmpeg · ${isPodcast?'podcast':'standard'} · ${scaleW}×${scaleH}…`;
 
-    // ── 7. Run final FFmpeg pass ───────────────────
+    // ── Final encode ──────────────────────────────
+    // filter_complex keeps video + audio on THE SAME CLOCK
+    // This is the only way to guarantee perfect sync
     await new Promise((resolve, reject) => {
       const cmd = ffmpeg(job.inputFile);
 
-      if (hasAudio && aFilters) {
-        // filter_complex: both streams share same clock — guaranteed sync
-        const vChain = `[0:v]${vFilters.join(',')}[vout]`;
-        const aChain = `[0:a]${aFilters.join(',')}[aout]`;
+      if (hasAudio) {
+        const vChain = `[0:v]${vf.join(',')}[vout]`;
+        const aChain = `[0:a]${af.join(',')}[aout]`;
         cmd
           .complexFilter(`${vChain};${aChain}`)
           .outputOptions([
@@ -277,11 +267,11 @@ async function processVideo(job, opts) {
             '-ar',       '48000',
             '-ac',       '2',
             '-movflags', '+faststart',
-            '-vsync',    'cfr',
+            '-vsync',    'cfr',         // constant frame rate — locks audio to video
           ]);
       } else {
         cmd.outputOptions([
-          '-vf',       vFilters.join(','),
+          '-vf',       vf.join(','),
           '-c:v',      'libx264',
           '-preset',   'fast',
           '-crf',      '16',
@@ -294,30 +284,30 @@ async function processVideo(job, opts) {
       cmd
         .output(job.outputFile)
         .on('progress', p => {
-          job.progress = Math.min(96, Math.round(22 + (p.percent || 0) * 0.74));
-          job.message  = `${job.progress}% · ${p.timemark || ''} · ${scaleW}×${scaleH}`;
+          job.progress = Math.min(96, Math.round(14 + (p.percent||0)*0.82));
+          job.message  = `${job.progress}% · ${p.timemark||''} · ${scaleW}×${scaleH}`;
         })
         .on('end', resolve)
-        .on('error', reject)
+        .on('error', e => {
+          console.error(`[${job.id}] FFmpeg error:`, e.message);
+          reject(e);
+        })
         .run();
     });
 
-    // Cleanup stab file
-    try { if (stabTrf) fs.unlinkSync(stabTrf); } catch(e) {}
-
     const size = fs.statSync(job.outputFile).size;
     if (size < 1000) throw new Error('Output file empty');
-
     job.status   = 'done';
     job.progress = 100;
-    job.message  = `✓ ${(size/1024/1024).toFixed(1)}MB · ${scaleW}×${scaleH} · ${freezeZones.length} zones fixed · stabilised · denoised · synced`;
+    job.message  = `✓ ${(size/1024/1024).toFixed(1)}MB · ${scaleW}×${scaleH} · ${freezeZones.length} zones fixed · synced`;
     console.log(`[${job.id}]`, job.message);
 
   } catch (err) {
-    console.error(`[${job.id}] Error:`, err.message);
+    console.error(`[${job.id}]`, err.message);
     job.status  = 'error';
     job.message = err.message;
-    try { if (job.inputFile) fs.unlinkSync(job.inputFile); } catch(e) {}
+  } finally {
+    try { fs.unlinkSync(job.inputFile); } catch(e) {}
   }
 }
 
@@ -339,7 +329,7 @@ app.get('/download/:id', (req, res) => {
   fs.createReadStream(j.outputFile).pipe(res);
 });
 
-app.get('/health', (req, res) => res.json({ ok: true, jobs: jobs.size }));
+app.get('/health', (req, res) => res.json({ ok: true, jobs: jobs.size, filters: AVAIL }));
 
 setInterval(() => {
   const cut = Date.now() - 2*60*60*1000;
@@ -351,4 +341,7 @@ setInterval(() => {
   }
 }, 30*60*1000);
 
-app.listen(PORT, () => console.log(`✓ Clarity Server on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✓ Clarity Server on port ${PORT}`);
+  console.log(`  Filters:`, AVAIL);
+});
