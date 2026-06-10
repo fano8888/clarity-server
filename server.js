@@ -25,10 +25,10 @@ app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 app.use(express.json());
 
 // ── Check available filters at startup ──────────────────────
-const FILTERS = { minterpolate:false, hqdn3d:false, arnndn:false, vidstab:false, nlmeans:false, cas:false };
+const FILTERS = { minterpolate:false, hqdn3d:false, arnndn:false, vidstab:false, pp:false };
 try {
   const out = execSync(`"${ffmpegPath}" -filters 2>&1`, { encoding:'utf8', timeout:8000 });
-  Object.keys(FILTERS).forEach(f => { FILTERS[f] = out.includes(f); });
+  Object.keys(FILTERS).forEach(f => { FILTERS[f] = out.includes(' '+f+' ') || out.includes('\t'+f+'\t'); });
   console.log('Filters:', FILTERS);
 } catch(e) {
   console.warn('Could not check filters');
@@ -165,14 +165,7 @@ async function processVideo(job, opts){
       vf.push(`fps=${outFps}`);
     }
 
-    // ── 3. Deblock ──────────────────────────────────────────
-    // Removes the blocky compression artifacts from Zoom/screen recordings
-    // pp=de8x8 is the strongest deblock filter available in ffmpeg-static
-    if(isPodcast || isMax){
-      vf.push(`pp=de8x8`);
-    }
-
-    // ── 4. Temporal denoise ─────────────────────────────────
+// ── 4. Temporal denoise ─────────────────────────────────
     // hqdn3d: removes noise across both space and time
     // For low-res (< 720p) use stronger settings — more to clean up
     if(FILTERS.hqdn3d){
