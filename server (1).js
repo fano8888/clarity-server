@@ -11,199 +11,195 @@ const os           = require('os');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
+console.log('[Clarity] ffmpeg:', ffmpegPath);
 
 const app  = express();
 const PORT = process.env.PORT || 3333;
-const UPLOAD_DIR = path.join(os.tmpdir(), 'clarity-uploads');
-const OUTPUT_DIR = path.join(os.tmpdir(), 'clarity-outputs');
+const TMP  = os.tmpdir();
+const UPLOAD_DIR = path.join(TMP, 'cu');
+const OUTPUT_DIR = path.join(TMP, 'co');
 [UPLOAD_DIR, OUTPUT_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-const storage = multer.diskStorage({
-  destination: UPLOAD_DIR,
-  filename: (req, file, cb) => cb(null, `${uuid()}${path.extname(file.originalname)||'.mp4'}`),
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: UPLOAD_DIR,
+    filename: (req, file, cb) => cb(null, uuid() + (path.extname(file.originalname) || '.mp4')),
+  }),
+  limits: { fileSize: 8 * 1024 * 1024 * 1024 },
 });
-const upload = multer({ storage, limits: { fileSize: 8*1024*1024*1024 } });
-const jobs = new Map();
 
-function pub(j) {
-  return { id:j.id, status:j.status, progress:j.progress, message:j.message,
-           downloadUrl: j.status==='done' ? `/download/${j.id}` : null };
-}
+const jobs = new Map();
+const pub = j => ({
+  id: j.id, status: j.status, progress: j.progress, message: j.message,
+  downloadUrl: j.status === 'done' ? `/download/${j.id}` : null,
+});
 
 app.post('/fix', upload.single('video'), (req, res) => {
-  if(!req.file) return res.status(400).json({ error:'No video' });
+  if (!req.file) return res.status(400).json({ error: 'No video' });
   const id = uuid();
   const job = {
-    id, status:'queued', progress:0, message:'Queued',
+    id, status: 'queued', progress: 0, message: 'Queued',
     inputFile:  req.file.path,
-    outputFile: path.join(OUTPUT_DIR, `${id}_fixed.mp4`),
+    outputFile: path.join(OUTPUT_DIR, id + '_out.mp4'),
     createdAt:  Date.now(),
   };
   jobs.set(id, job);
-  res.json({ jobId:id, pollUrl:`/job/${id}` });
-  processVideo(job, req.query);
+  res.json({ jobId: id, pollUrl: `/job/${id}` });
+  run(job, req.query).catch(e => {
+    job.status = 'error';
+    job.message = e.message;
+    console.error('[' + id + '] Fatal:', e.message);
+  });
 });
 
-async function processVideo(job, q) {
-  job.status='processing'; job.progress=2; job.message='Probing…';
-  try {
-    const probe = await new Promise((res,rej) =>
-      ffmpeg.ffprobe(job.inputFile, (err,d) => err ? rej(err) : res(d))
-    );
-    const vs  = probe.streams.find(s=>s.codec_type==='video');
-    const as  = probe.streams.find(s=>s.codec_type==='audio');
-    const srcW = vs?.width  || 1280;
-    const srcH = vs?.height || 720;
-    const hasAudio = !!as;
-    const isPodcast = q.mode === 'podcast';
-    const isTrim    = q.mode === 'trim';
-    const dur = parseFloat(probe.format.duration||'0');
+async function run(job, q) {
+  job.status = 'processing'; job.progress = 2; job.message = 'Probing…';
 
-    // ── Trim ────────────────────────────────────────────────
-    if(isTrim) {
-      const s = parseFloat(q.start||'0');
-      const e = parseFloat(q.end||String(dur));
-      job.message='Trimming…'; job.progress=10;
-      await new Promise((res,rej) => {
-        ffmpeg(job.inputFile).seekInput(s).duration(e-s)
-          .outputOptions(['-c:v','copy','-c:a','aac','-b:a','192k','-movflags','+faststart'])
-          .output(job.outputFile)
-          .on('progress',p=>{job.progress=Math.min(96,Math.round(10+(p.percent||0)*0.86));})
-          .on('end',res).on('error',rej).run();
-      });
-      const sz = fs.statSync(job.outputFile).size;
-      if(sz<1000) throw new Error('Output empty');
-      job.status='done'; job.progress=100; job.message=`✓ Trimmed · ${(sz/1024/1024).toFixed(1)}MB`;
-      return;
-    }
+  // Probe
+  const probe = await new Promise((res, rej) =>
+    ffmpeg.ffprobe(job.inputFile, (err, d) => err ? rej(err) : res(d))
+  );
+  const vs  = probe.streams.find(s => s.codec_type === 'video');
+  const as  = probe.streams.find(s => s.codec_type === 'audio');
+  const dur = parseFloat(probe.format.duration || '0');
+  const srcW = vs ? vs.width  : 1280;
+  const srcH = vs ? vs.height : 720;
+  const hasAudio = !!as;
 
-    // ── Resolution ──────────────────────────────────────────
-    let scaleW=srcW, scaleH=srcH;
-    if(q.upscale==='4k')  { scaleW=3840; scaleH=2160; }
-    if(q.upscale==='2k')  { scaleW=2560; scaleH=1440; }
-    if(q.upscale==='1080'){ scaleW=1920; scaleH=1080; }
-    if(scaleW<srcW) { scaleW=srcW; scaleH=srcH; }
-    const isUpscaling = scaleW > srcW;
-    const isLowRes    = srcH < 720;
+  const isTrim = q.mode === 'trim';
+  const isAudio = q.mode === 'audio';
 
-    job.message=`${srcW}×${srcH} → ${scaleW}×${scaleH}…`; job.progress=8;
+  // Trim mode
+  if (isTrim) {
+    const s = parseFloat(q.start || '0');
+    const e = parseFloat(q.end || String(dur));
+    job.message = 'Trimming…'; job.progress = 10;
+    await encode(job, ['-ss', String(s), '-i', job.inputFile, '-t', String(e - s),
+      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', job.outputFile]);
+    finalise(job);
+    return;
+  }
 
-    // ── VIDEO FILTERS ────────────────────────────────────────
-    // Only using filters guaranteed in ffmpeg-static:
-    // mpdecimate, setpts, fps, hqdn3d, scale, unsharp, eq, format
-    const vf = [];
+  // Audio-only mode
+  if (isAudio && hasAudio) {
+    job.message = 'Cleaning audio…'; job.progress = 10;
+    const af = 'highpass=f=80,lowpass=f=12000,acompressor=threshold=-18dB:ratio=4:attack=5:release=100:makeup=3dB,loudnorm=I=-14:TP=-1:LRA=11,aformat=sample_rates=48000:channel_layouts=stereo';
+    await encode(job, ['-i', job.inputFile,
+      '-c:v', 'copy', '-af', af, '-c:a', 'aac', '-b:a', '320k', '-movflags', '+faststart', job.outputFile]);
+    finalise(job);
+    return;
+  }
 
-    // Fix lag/frozen frames
-    vf.push(`mpdecimate=max=0:hi=512:lo=256:frac=0.1`);
-    vf.push(`setpts=N/FRAME_RATE/TB`);
-    vf.push(`fps=30`);
+  // Scale
+  let scaleW = srcW, scaleH = srcH;
+  if (q.upscale === '4k')   { scaleW = 3840; scaleH = 2160; }
+  if (q.upscale === '2k')   { scaleW = 2560; scaleH = 1440; }
+  if (q.upscale === '1080') { scaleW = 1920; scaleH = 1080; }
+  if (scaleW < srcW) { scaleW = srcW; scaleH = srcH; }
+  const isUp = scaleW > srcW;
+  const isLow = srcH < 720;
 
-    // Denoise (hqdn3d is in ffmpeg-static)
-    if(isLowRes || isPodcast) {
-      vf.push(`hqdn3d=4:3:6:4`);
-    }
+  job.message = srcW + 'x' + srcH + ' -> ' + scaleW + 'x' + scaleH; job.progress = 8;
 
-    // Upscale
-    if(isUpscaling) {
-      vf.push(`scale=${scaleW}:${scaleH}:flags=lanczos:force_original_aspect_ratio=decrease`);
-      vf.push(`pad=${scaleW}:${scaleH}:(ow-iw)/2:(oh-ih)/2`);
-    }
+  // Build video filter — SIMPLE, no complexFilter, no mpdecimate
+  const vFilters = [];
+  if (isLow) vFilters.push('hqdn3d=4:3:6:4');
+  if (isUp) {
+    vFilters.push('scale=' + scaleW + ':' + scaleH + ':flags=lanczos:force_original_aspect_ratio=decrease');
+    vFilters.push('pad=' + scaleW + ':' + scaleH + ':(ow-iw)/2:(oh-ih)/2');
+  }
+  vFilters.push('unsharp=5:5:1.5:3:3:0.5');
+  vFilters.push('eq=contrast=1.06:brightness=0.01:saturation=1.1');
+  vFilters.push('format=yuv420p');
 
-    // Sharpen
-    const sl = isUpscaling ? 2.0 : 1.5;
-    vf.push(`unsharp=5:5:${sl}:3:3:0.5`);
+  // Build audio filter — SIMPLE separate chain
+  const aFilters = 'highpass=f=80,lowpass=f=12000,acompressor=threshold=-18dB:ratio=4:attack=5:release=100:makeup=3dB,loudnorm=I=-14:TP=-1:LRA=11,aformat=sample_rates=48000:channel_layouts=stereo';
 
-    // Contrast/saturation
-    vf.push(`eq=contrast=1.06:brightness=0.01:saturation=1.1`);
-    vf.push(`format=yuv420p`);
+  job.message = 'Encoding ' + scaleW + 'x' + scaleH + '…'; job.progress = 12;
 
-    // ── AUDIO FILTERS ────────────────────────────────────────
-    // Only using guaranteed filters: highpass, lowpass, acompressor, loudnorm, aformat
-    // Removed: equalizer, agate, aresample, asetpts — these cause code 234
-    const af = [
-      `highpass=f=80`,
-      `lowpass=f=12000`,
-      `acompressor=threshold=-18dB:ratio=4:attack=5:release=100:makeup=3dB`,
-      `loudnorm=I=-14:TP=-1:LRA=11`,
-      `aformat=sample_rates=48000:channel_layouts=stereo`,
-    ];
+  // Encode — use SEPARATE -vf and -af, NOT complexFilter
+  const args = ['-i', job.inputFile,
+    '-vf', vFilters.join(','),
+    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+  ];
+  if (hasAudio) {
+    args.push('-af', aFilters, '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2');
+  } else {
+    args.push('-an');
+  }
+  args.push('-movflags', '+faststart', job.outputFile);
 
-    job.progress=12; job.message=`Encoding ${scaleW}×${scaleH}…`;
+  await encode(job, args);
+  finalise(job);
+}
 
-    // ── ENCODE ───────────────────────────────────────────────
-    await new Promise((resolve, reject) => {
-      const cmd = ffmpeg(job.inputFile);
-
-      if(hasAudio) {
-        cmd.complexFilter(`[0:v]${vf.join(',')}[vout];[0:a]${af.join(',')}[aout]`)
-           .outputOptions([
-             '-map','[vout]','-map','[aout]',
-             '-c:v','libx264','-preset','fast','-crf','18',
-             '-c:a','aac','-b:a','192k','-ar','48000','-ac','2',
-             '-movflags','+faststart',
-           ]);
+function encode(job, args) {
+  return new Promise((resolve, reject) => {
+    const { execFile } = require('child_process');
+    const proc = execFile(ffmpegPath, ['-y', ...args], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error('[' + job.id + '] ffmpeg error:', err.message);
+        console.error(stderr.slice(-500));
+        reject(err);
       } else {
-        cmd.outputOptions([
-          `-vf`, vf.join(','),
-          '-c:v','libx264','-preset','fast','-crf','18','-an',
-          '-movflags','+faststart',
-        ]);
+        resolve();
       }
-
-      cmd.output(job.outputFile)
-         .on('progress', p => {
-           job.progress = Math.min(96, Math.round(12 + (p.percent||0) * 0.84));
-           job.message  = `${job.progress}% · ${p.timemark||''} · ${scaleW}×${scaleH}`;
-         })
-         .on('end', resolve)
-         .on('error', e => { console.error(`[${job.id}]`, e.message); reject(e); })
-         .run();
     });
+    // Parse progress from stderr
+    proc.stderr.on('data', chunk => {
+      const m = chunk.match(/time=(\d+):(\d+):(\d+)/);
+      if (m) {
+        const secs = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseInt(m[3]);
+        job.progress = Math.min(96, Math.round(12 + (secs / 1200) * 84));
+        job.message = job.progress + '% processed';
+      }
+    });
+  });
+}
 
+function finalise(job) {
+  try {
     const size = fs.statSync(job.outputFile).size;
-    if(size < 1000) throw new Error('Output file empty');
-    job.status='done'; job.progress=100;
-    job.message=`✓ ${(size/1024/1024).toFixed(1)}MB · ${scaleW}×${scaleH}`;
-    console.log(`[${job.id}]`, job.message);
-
-  } catch(err) {
-    console.error(`[${job.id}] Error:`, err.message);
-    job.status='error'; job.message=err.message;
+    if (size < 1000) throw new Error('Output empty');
+    job.status = 'done'; job.progress = 100;
+    job.message = '✓ ' + (size / 1024 / 1024).toFixed(1) + 'MB';
+    console.log('[' + job.id + ']', job.message);
+  } catch(e) {
+    job.status = 'error'; job.message = e.message;
   } finally {
     try { fs.unlinkSync(job.inputFile); } catch(e) {}
   }
 }
 
-app.get('/job/:id', (req,res) => {
+app.get('/job/:id', (req, res) => {
   const j = jobs.get(req.params.id);
-  if(!j) return res.status(404).json({error:'Not found'});
+  if (!j) return res.status(404).json({ error: 'Not found' });
   res.json(pub(j));
 });
 
-app.get('/download/:id', (req,res) => {
+app.get('/download/:id', (req, res) => {
   const j = jobs.get(req.params.id);
-  if(!j||j.status!=='done') return res.status(404).json({error:'Not ready'});
-  if(!fs.existsSync(j.outputFile)) return res.status(410).json({error:'Expired'});
-  const size = fs.statSync(j.outputFile).size;
-  res.setHeader('Content-Type','video/mp4');
-  res.setHeader('Content-Length',size);
-  res.setHeader('Content-Disposition','attachment; filename="clarity_fixed.mp4"');
+  if (!j || j.status !== 'done') return res.status(404).json({ error: 'Not ready' });
+  if (!fs.existsSync(j.outputFile)) return res.status(410).json({ error: 'Expired' });
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Length', fs.statSync(j.outputFile).size);
+  res.setHeader('Content-Disposition', 'attachment; filename="fixed.mp4"');
   fs.createReadStream(j.outputFile).pipe(res);
 });
 
-app.get('/health', (req,res) => res.json({ok:true, jobs:jobs.size}));
+app.get('/health', (req, res) => res.json({ ok: true, jobs: jobs.size, v: '4.0' }));
 
 setInterval(() => {
-  const cut = Date.now() - 2*60*60*1000;
-  for(const [id,j] of jobs) {
-    if(j.createdAt < cut) {
+  const cut = Date.now() - 2 * 60 * 60 * 1000;
+  for (const [id, j] of jobs) {
+    if (j.createdAt < cut) {
       try { fs.unlinkSync(j.outputFile); } catch(e) {}
       jobs.delete(id);
     }
   }
-}, 30*60*1000);
+}, 30 * 60 * 1000);
 
-app.listen(PORT, () => console.log(`✓ Clarity Server port ${PORT}`));
+app.listen(PORT, () => console.log('✓ Clarity v4.0 port', PORT));
